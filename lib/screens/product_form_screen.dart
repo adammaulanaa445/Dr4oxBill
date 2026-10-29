@@ -1,4 +1,4 @@
-/// Layar form tambah/edit produk dan jasa.
+/// Layar form tambah/edit produk (barang fisik).
 library product_form_screen;
 
 import 'dart:io';
@@ -11,10 +11,8 @@ import '../providers/product_provider.dart';
 import '../providers/category_provider.dart';
 import '../models/product.dart';
 import '../models/category.dart';
-import '../core/utils/money.dart';
 import '../services/file_service.dart';
 import '../services/image_service.dart';
-import '../widgets/sidebar.dart';
 
 class ProductFormScreen extends StatefulWidget {
   final Product? product; // null untuk tambah baru.
@@ -35,6 +33,7 @@ class _ProductFormScreenState extends State<ProductFormScreen> {
   final _minStockController = TextEditingController();
   final _descriptionController = TextEditingController();
 
+  // Produk baru selalu barang fisik. Saat edit, tipe lama dipertahankan.
   String _itemType = 'goods';
   int? _selectedCategoryId;
   List<Category> _categories = [];
@@ -85,6 +84,10 @@ class _ProductFormScreenState extends State<ProductFormScreen> {
     super.dispose();
   }
 
+  /// Kategori "Jasa" disembunyikan karena jasa ditambahkan manual di kasir.
+  bool _isServiceCategory(Category c) =>
+      (c.name ?? '').trim().toLowerCase() == 'jasa';
+
   Future<void> _pickPhoto() async {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.image,
@@ -94,6 +97,7 @@ class _ProductFormScreenState extends State<ProductFormScreen> {
       final validation = await ImageService.validateImage(
         File(result.files.single.path!),
       );
+      if (!mounted) return;
       if (!validation.isValid) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -112,6 +116,7 @@ class _ProductFormScreenState extends State<ProductFormScreen> {
   Future<void> _savePhotoToAppDir() async {
     if (_photoPath == null) return;
     final result = await FileService.saveProductPhoto(_photoPath!);
+    if (!mounted) return;
     if (result.success) {
       setState(() {
         _photoPath = result.path;
@@ -171,6 +176,7 @@ class _ProductFormScreenState extends State<ProductFormScreen> {
       if (!mounted) return;
       Navigator.pop(context, true);
     } catch (e) {
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text('Gagal menyimpan produk: $e'),
@@ -191,6 +197,14 @@ class _ProductFormScreenState extends State<ProductFormScreen> {
       body: Consumer<CategoryProvider>(
         builder: (context, categoryProvider, child) {
           _categories = categoryProvider.categories;
+          final visibleCategories =
+              _categories.where((c) => !_isServiceCategory(c)).toList();
+          // Hindari error dropdown bila kategori terpilih sudah disembunyikan.
+          final categoryValue =
+              visibleCategories.any((c) => c.id == _selectedCategoryId)
+                  ? _selectedCategoryId
+                  : null;
+
           return SingleChildScrollView(
             padding: const EdgeInsets.all(16),
             child: Form(
@@ -221,7 +235,8 @@ class _ProductFormScreenState extends State<ProductFormScreen> {
                   ),
                   const SizedBox(height: 12),
                   DropdownButtonFormField<int?>(
-                    value: _selectedCategoryId,
+                    value: categoryValue,
+                    isExpanded: true,
                     decoration: const InputDecoration(
                       labelText: 'Kategori',
                       prefixIcon: Icon(Icons.category),
@@ -231,33 +246,14 @@ class _ProductFormScreenState extends State<ProductFormScreen> {
                         value: null,
                         child: Text('Tanpa Kategori'),
                       ),
-                      ..._categories.map((cat) {
+                      ...visibleCategories.map((cat) {
                         return DropdownMenuItem<int?>(
                           value: cat.id,
                           child: Text(cat.name ?? ''),
                         );
-                      }).toList(),
+                      }),
                     ],
                     onChanged: (v) => setState(() => _selectedCategoryId = v),
-                  ),
-                  const SizedBox(height: 12),
-                  DropdownButtonFormField<String>(
-                    value: _itemType,
-                    decoration: const InputDecoration(
-                      labelText: 'Jenis Item *',
-                      prefixIcon: Icon(Icons.inventory),
-                    ),
-                    items: const [
-                      DropdownMenuItem(
-                        value: 'goods',
-                        child: Text('Barang Fisik'),
-                      ),
-                      DropdownMenuItem(
-                        value: 'service',
-                        child: Text('Jasa'),
-                      ),
-                    ],
-                    onChanged: (v) => setState(() => _itemType = v!),
                   ),
                   const SizedBox(height: 12),
                   TextFormField(
@@ -335,8 +331,10 @@ class _ProductFormScreenState extends State<ProductFormScreen> {
                   if (_photoPath != null) ...[
                     const SizedBox(height: 8),
                     Text(
-                      'Foto: ${_photoPath!.split('/').last}',
+                      'Foto: ${_photoPath!.split(RegExp(r'[\\/]')).last}',
                       style: const TextStyle(fontSize: 12, color: Colors.grey),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                     ),
                   ],
                   const SizedBox(height: 12),

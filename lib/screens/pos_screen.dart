@@ -2,22 +2,23 @@
 library pos_screen;
 
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart';
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
+import 'package:printing/printing.dart';
 import 'package:provider/provider.dart';
 
 import '../providers/product_provider.dart';
 import '../providers/category_provider.dart';
 import '../providers/cart_provider.dart';
 import '../providers/setting_provider.dart';
-import '../providers/transaction_provider.dart';
 import '../models/product.dart';
+import '../models/category.dart';
 import '../core/utils/money.dart';
 import '../core/constants/app_constants.dart';
-import '../repositories/transaction_repository.dart';
-import '../services/pdf_service.dart';
-import '../services/file_service.dart';
+import '../core/database/app_database.dart';
 
 class PosScreen extends StatefulWidget {
   const PosScreen({super.key});
@@ -30,8 +31,12 @@ class _PosScreenState extends State<PosScreen> {
   final _searchController = TextEditingController();
   String _searchQuery = '';
   int? _selectedCategoryId;
-  List<dynamic> _categories = [];
-  bool _isProcessingPayment = false;
+  List<Category> _categories = [];
+  bool _isProcessingPayment = false; // Cegah transaksi ganda.
+
+  /// Ukuran kertas struk. Untuk printer biasa ganti ke PdfPageFormat.a5
+  /// atau PdfPageFormat.a4. Untuk thermal 58mm ganti ke PdfPageFormat.roll57.
+  PdfPageFormat get _receiptFormat => PdfPageFormat.roll80;
 
   @override
   void initState() {
@@ -39,17 +44,20 @@ class _PosScreenState extends State<PosScreen> {
     _loadData();
   }
 
+  /// Kategori "Jasa" disembunyikan karena jasa ditambahkan manual.
+  bool _isServiceCategory(Category c) =>
+      (c.name ?? '').trim().toLowerCase() == 'jasa';
+
   Future<void> _loadData() async {
-    final productProvider = context.read<ProductProvider>();
-    final categoryProvider = context.read<CategoryProvider>();
-
-    await productProvider.loadProducts();
-    await categoryProvider.loadCategories();
-
+    await context.read<ProductProvider>().loadProducts();
+    await context.read<CategoryProvider>().loadCategories();
     if (!mounted) return;
-
     setState(() {
-      _categories = categoryProvider.categories;
+      _categories = context
+          .read<CategoryProvider>()
+          .categories
+          .where((c) => !_isServiceCategory(c))
+          .toList();
     });
   }
 
@@ -59,24 +67,22 @@ class _PosScreenState extends State<PosScreen> {
     super.dispose();
   }
 
+  /// Katalog hanya menampilkan barang fisik.
   List<Product> get _filteredProducts {
     final products = context.read<ProductProvider>().activeProducts;
-
     return products.where((product) {
+      if (!product.isGoods) return false;
       if (_searchQuery.isNotEmpty) {
         final query = _searchQuery.toLowerCase();
-
         if (!product.name.toLowerCase().contains(query) &&
             !product.sku.toLowerCase().contains(query)) {
           return false;
         }
       }
-
       if (_selectedCategoryId != null &&
           product.categoryId != _selectedCategoryId) {
         return false;
       }
-
       return true;
     }).toList();
   }
@@ -91,9 +97,7 @@ class _PosScreenState extends State<PosScreen> {
       );
       return;
     }
-
     context.read<CartProvider>().addProduct(product);
-
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text('${product.name} ditambahkan ke keranjang.'),
@@ -102,9 +106,28 @@ class _PosScreenState extends State<PosScreen> {
     );
   }
 
+  /// Dialog tambah jasa manual (nama jasa dan harga).
+  Future<void> _showAddServiceDialog() async {
+    final result = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (_) => const _ServiceDialog(),
+    );
+    if (result == null || !mounted) return;
+
+    context.read<CartProvider>().addManualService(
+          name: result['name'] as String,
+          price: result['price'] as int,
+        );
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('${result['name']} ditambahkan ke keranjang.'),
+        duration: const Duration(seconds: 1),
+      ),
+    );
+  }
+
   void _openCheckout() {
     final cart = context.read<CartProvider>();
-
     if (cart.items.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -115,8 +138,7 @@ class _PosScreenState extends State<PosScreen> {
       return;
     }
 
-    final validation = cart.validate(validateCash: false);
-
+    final validation = cart.validate();
     if (validation != null) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -132,7 +154,6 @@ class _PosScreenState extends State<PosScreen> {
 
   void _showPaymentDialog() {
     final cart = context.read<CartProvider>();
-
     final cashController = TextEditingController(
       text: cart.cashReceived.toString(),
     );
@@ -169,7 +190,6 @@ class _PosScreenState extends State<PosScreen> {
                       onChanged: (value) {
                         final parsed =
                             int.tryParse(value.replaceAll('.', '')) ?? 0;
-
                         cart.setCashReceived(parsed);
                         setDialogState(() {});
                       },
@@ -186,7 +206,8 @@ class _PosScreenState extends State<PosScreen> {
                                 : 'Uang kurang',
                             style: TextStyle(
                               fontWeight: FontWeight.bold,
-                              color: change != null ? Colors.green : Colors.red,
+                              color:
+                                  change != null ? Colors.green : Colors.red,
                             ),
                             overflow: TextOverflow.ellipsis,
                           ),
@@ -215,15 +236,8 @@ class _PosScreenState extends State<PosScreen> {
     );
   }
 
-  Future<void> _processPayment(
-    TextEditingController cashController,
-  ) async {
-    if (_isProcessingPayment) return;
-
+  Future<void> _processPayment(TextEditingController cashController) async {
     final cart = context.read<CartProvider>();
-    final productProvider = context.read<ProductProvider>();
-    final settingProvider = context.read<SettingProvider>();
-    final transactionProvider = context.read<TransactionProvider>();
 
     setState(() {
       _isProcessingPayment = true;
@@ -231,7 +245,6 @@ class _PosScreenState extends State<PosScreen> {
 
     try {
       final now = DateTime.now();
-
       final transactionNumber =
           'INV-${now.year}${now.month.toString().padLeft(2, '0')}${now.day.toString().padLeft(2, '0')}_${now.millisecondsSinceEpoch}';
 
@@ -240,6 +253,7 @@ class _PosScreenState extends State<PosScreen> {
           ) ??
           0;
 
+      // Simpan nilai sebelum keranjang dikosongkan (dipakai untuk struk).
       final subtotal = cart.itemSubtotal;
       final discount = cart.discount;
       final total = cart.total;
@@ -249,60 +263,77 @@ class _PosScreenState extends State<PosScreen> {
       final items = cart.toTransactionItems();
       final stockUpdates = cart.toStockUpdates();
 
-      final repository = TransactionRepository();
+      final db = await AppDatabase().database;
 
-      final saveResult = await repository.createTransaction(
-        transactionNumber: transactionNumber,
-        transactionDate: now,
-        subtotal: subtotal,
-        discount: discount,
-        total: total,
-        cashReceived: cashReceived,
-        changeAmount: changeAmount,
-        paymentMethod: paymentMethod,
-        items: items,
-        stockUpdates: stockUpdates,
-      );
+      // Operasi transaksi atomik.
+      await db.transaction((txn) async {
+        // 1. Simpan transaksi utama.
+        final transactionId = await txn.insert('transactions', {
+          'transaction_number': transactionNumber,
+          'transaction_date': now.toIso8601String(),
+          'subtotal': subtotal,
+          'discount': discount,
+          'total': total,
+          'cash_received': cashReceived,
+          'change_amount': changeAmount,
+          'payment_method': paymentMethod,
+          'status': 'completed',
+          'created_at': now.toIso8601String(),
+          'updated_at': now.toIso8601String(),
+        });
 
-      if (!mounted) return;
+        // 2. Simpan detail semua item (jasa manual: product_id null).
+        for (final item in items) {
+          await txn.insert('transaction_items', {
+            'transaction_id': transactionId,
+            'product_id': item['product_id'],
+            'sku': item['sku'],
+            'name': item['name'],
+            'item_type': item['item_type'],
+            'quantity': item['quantity'],
+            'unit_price': item['unit_price'],
+            'subtotal': item['subtotal'],
+            'discount': item['discount'] ?? 0,
+          });
+        }
 
-      if (!saveResult.success) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              'Gagal menyimpan transaksi: ${saveResult.error}',
-            ),
-            backgroundColor: Colors.red,
-          ),
-        );
-        return;
-      }
+        // 3. Kurangi stok dan catat pergerakan stok (hanya barang fisik).
+        for (final update in stockUpdates) {
+          await txn.update(
+            'products',
+            {
+              'stock': update['new_stock'],
+              'updated_at': now.toIso8601String(),
+            },
+            where: 'id = ?',
+            whereArgs: [update['product_id']],
+          );
 
-      // Kosongkan keranjang setelah transaksi berhasil disimpan.
+          await txn.insert('stock_movements', {
+            'product_id': update['product_id'],
+            'movement_type': 'sale',
+            'quantity_change': -update['quantity_sold'],
+            'stock_before': update['stock_before'],
+            'stock_after': update['new_stock'],
+            'reason': 'Penjualan transaksi $transactionNumber',
+            'reference_type': 'transaction',
+            'reference_id': transactionId,
+            'created_at': now.toIso8601String(),
+          });
+        }
+      });
+
+      // Kosongkan keranjang hanya setelah commit berhasil.
       cart.clear();
 
+      if (!mounted) return;
       Navigator.pop(context);
 
-      await productProvider.loadProducts();
-      await settingProvider.loadSettings();
-      await transactionProvider.loadTransactions();
+      // Muat ulang data.
+      await context.read<ProductProvider>().loadProducts();
+      await context.read<SettingProvider>().loadSettings();
 
       if (!mounted) return;
-
-      final receiptResult = await _generateReceipt(
-        transactionNumber: transactionNumber,
-        transactionDate: now,
-        subtotal: subtotal,
-        discount: discount,
-        total: total,
-        cashReceived: cashReceived,
-        changeAmount: changeAmount,
-        paymentMethod: paymentMethod,
-        items: items,
-      );
-
-      if (!mounted) return;
-
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('Transaksi berhasil disimpan.'),
@@ -310,69 +341,20 @@ class _PosScreenState extends State<PosScreen> {
         ),
       );
 
-      if (receiptResult.success && receiptResult.filePath != null) {
-        if (kIsWeb) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text(
-                'Struk dibuka. Gunakan Save as PDF untuk menyimpan.',
-              ),
-            ),
-          );
-          return;
-        }
-
-        final shouldPrint = await showDialog<bool>(
-          context: context,
-          builder: (dialogContext) => AlertDialog(
-            title: const Text('Struk PDF'),
-            content: Text(
-              'Struk berhasil dibuat:\n${receiptResult.filePath}\n\n'
-              'Apakah ingin mencetak struk sekarang?',
-            ),
-            actions: [
-              TextButton(
-                onPressed: () {
-                  Navigator.pop(dialogContext, false);
-                },
-                child: const Text('Nanti'),
-              ),
-              ElevatedButton(
-                onPressed: () {
-                  Navigator.pop(dialogContext, true);
-                },
-                child: const Text('Cetak'),
-              ),
-            ],
-          ),
-        );
-
-        if (shouldPrint == true && mounted) {
-          final pdfService = PdfService();
-          await pdfService.printPdf(receiptResult.filePath!);
-        }
-      } else if (receiptResult.error != null) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              'Gagal membuat struk: ${receiptResult.error}',
-            ),
-            backgroundColor: Colors.red,
-          ),
-        );
-      } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'Transaksi tersimpan, tetapi struk belum berhasil dibuat.',
-            ),
-            backgroundColor: Colors.orange,
-          ),
-        );
-      }
+      // Tampilkan pratinjau struk (bisa dicetak atau disimpan sebagai PDF).
+      await _showReceipt(
+        transactionNumber: transactionNumber,
+        transactionDate: now,
+        subtotal: subtotal,
+        discount: discount,
+        total: total,
+        cashReceived: cashReceived,
+        changeAmount: changeAmount,
+        paymentMethod: paymentMethod,
+        items: items,
+      );
     } catch (e) {
       if (!mounted) return;
-
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text('Gagal menyimpan transaksi: $e'),
@@ -388,7 +370,13 @@ class _PosScreenState extends State<PosScreen> {
     }
   }
 
-  Future<PdfResult> _generateReceipt({
+  // ---------------------------------------------------------------------------
+  // Struk
+  // ---------------------------------------------------------------------------
+
+  /// Buat struk lalu tampilkan pratinjau/dialog cetak.
+  /// Gagal membuat struk tidak membatalkan transaksi yang sudah tersimpan.
+  Future<void> _showReceipt({
     required String transactionNumber,
     required DateTime transactionDate,
     required int subtotal,
@@ -401,49 +389,20 @@ class _PosScreenState extends State<PosScreen> {
   }) async {
     try {
       final settingProvider = context.read<SettingProvider>();
+      final businessName = settingProvider.get('business_name',
+          defaultValue: defaultBusinessName);
+      final businessAddress =
+          settingProvider.get('business_address', defaultValue: '');
+      final businessPhone =
+          settingProvider.get('business_phone', defaultValue: '');
+      final thankYouMessage = settingProvider.get('thank_you_message',
+          defaultValue: 'Terima kasih telah berkunjung ke Dr4ox Motor');
 
-      final businessName = settingProvider.get(
-        'business_name',
-        defaultValue: defaultBusinessName,
-      );
-
-      final businessAddress = settingProvider.get(
-        'business_address',
-        defaultValue: '',
-      );
-
-      final businessPhone = settingProvider.get(
-        'business_phone',
-        defaultValue: '',
-      );
-
-      final thankYouMessage = settingProvider.get(
-        'thank_you_message',
-        defaultValue: 'Terima kasih telah berkunjung ke Dr4ox Motor',
-      );
-
-      final receiptItems = items.map((item) {
-        return ReceiptItem(
-          name: item['name'] as String,
-          quantity: item['quantity'] as int,
-          subtotal: item['subtotal'] as int,
-        );
-      }).toList();
-
-      // PERBAIKAN:
-      // Flutter Web tidak boleh menggunakan Directory dari dart:io
-      // untuk menentukan folder penyimpanan dokumen.
-      final String docsDir;
-
-      if (kIsWeb) {
-        docsDir = '';
-      } else {
-        docsDir = await FileService.getDocumentsDir();
-      }
-
-      final pdfService = PdfService();
-
-      final result = await pdfService.generateReceipt(
+      final bytes = await _buildReceiptPdf(
+        businessName: businessName,
+        businessAddress: businessAddress,
+        businessPhone: businessPhone,
+        thankYouMessage: thankYouMessage,
         transactionNumber: transactionNumber,
         transactionDate: transactionDate,
         subtotal: subtotal,
@@ -452,35 +411,164 @@ class _PosScreenState extends State<PosScreen> {
         cashReceived: cashReceived,
         changeAmount: changeAmount,
         paymentMethod: paymentMethod,
-        items: receiptItems,
-        outputDir: docsDir,
-        businessName: businessName,
-        businessAddress: businessAddress,
-        businessPhone: businessPhone,
-        thankYouMessage: thankYouMessage,
+        items: items,
       );
 
-      if (result.success && result.filePath != null) {
-        // ignore: avoid_print
-        print('Struk diproses: ${result.filePath}');
-      }
-
-      return result;
-    } catch (e) {
-      // Kegagalan membuat struk tidak membatalkan transaksi.
-      return PdfResult.error('Gagal generate struk: $e');
+      await Printing.layoutPdf(
+        name: transactionNumber,
+        format: _receiptFormat,
+        onLayout: (_) async => bytes,
+      );
+    } catch (e, st) {
+      debugPrint('Struk ERROR: $e\n$st');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Transaksi tersimpan, tetapi struk gagal dibuat: $e'),
+          backgroundColor: Colors.orange,
+          duration: const Duration(seconds: 6),
+        ),
+      );
     }
   }
 
-  // ===========================================================
+  String _formatReceiptDate(DateTime d) {
+    String two(int n) => n.toString().padLeft(2, '0');
+    return '${two(d.day)}/${two(d.month)}/${d.year} ${two(d.hour)}:${two(d.minute)}';
+  }
+
+  String _paymentLabel(String method) {
+    switch (method) {
+      case 'cash':
+        return 'Tunai';
+      default:
+        return method;
+    }
+  }
+
+  Future<Uint8List> _buildReceiptPdf({
+    required String businessName,
+    required String businessAddress,
+    required String businessPhone,
+    required String thankYouMessage,
+    required String transactionNumber,
+    required DateTime transactionDate,
+    required int subtotal,
+    required int discount,
+    required int total,
+    required int cashReceived,
+    required int changeAmount,
+    required String paymentMethod,
+    required List<Map<String, dynamic>> items,
+  }) async {
+    final doc = pw.Document();
+
+    pw.Widget row(String left, String right, {bool bold = false}) {
+      final style = pw.TextStyle(
+        fontSize: 9,
+        fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal,
+      );
+      return pw.Row(
+        mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+        children: [
+          pw.Text(left, style: style),
+          pw.Text(right, style: style),
+        ],
+      );
+    }
+
+    pw.Widget divider() => pw.Padding(
+          padding: const pw.EdgeInsets.symmetric(vertical: 4),
+          child: pw.Divider(
+            height: 1,
+            thickness: 0.5,
+            borderStyle: pw.BorderStyle.dashed,
+          ),
+        );
+
+    doc.addPage(
+      pw.Page(
+        pageFormat: _receiptFormat,
+        build: (context) {
+          return pw.Column(
+            crossAxisAlignment: pw.CrossAxisAlignment.stretch,
+            children: [
+              pw.Text(
+                businessName,
+                textAlign: pw.TextAlign.center,
+                style: pw.TextStyle(
+                  fontSize: 13,
+                  fontWeight: pw.FontWeight.bold,
+                ),
+              ),
+              if (businessAddress.trim().isNotEmpty)
+                pw.Text(
+                  businessAddress,
+                  textAlign: pw.TextAlign.center,
+                  style: const pw.TextStyle(fontSize: 8),
+                ),
+              if (businessPhone.trim().isNotEmpty)
+                pw.Text(
+                  businessPhone,
+                  textAlign: pw.TextAlign.center,
+                  style: const pw.TextStyle(fontSize: 8),
+                ),
+              divider(),
+              row('No', transactionNumber),
+              row('Tanggal', _formatReceiptDate(transactionDate)),
+              row('Bayar', _paymentLabel(paymentMethod)),
+              divider(),
+              ...items.map((item) {
+                final qty = item['quantity'] as int;
+                final unit = item['unit_price'] as int;
+                final sub = item['subtotal'] as int;
+                return pw.Padding(
+                  padding: const pw.EdgeInsets.only(bottom: 3),
+                  child: pw.Column(
+                    crossAxisAlignment: pw.CrossAxisAlignment.start,
+                    children: [
+                      pw.Text(
+                        item['name'] as String,
+                        style: pw.TextStyle(
+                          fontSize: 9,
+                          fontWeight: pw.FontWeight.bold,
+                        ),
+                      ),
+                      row('$qty x ${formatRupiah(unit)}', formatRupiah(sub)),
+                    ],
+                  ),
+                );
+              }),
+              divider(),
+              row('Subtotal', formatRupiah(subtotal)),
+              if (discount > 0) row('Diskon', '-${formatRupiah(discount)}'),
+              row('TOTAL', formatRupiah(total), bold: true),
+              row('Uang diterima', formatRupiah(cashReceived)),
+              row('Kembalian', formatRupiah(changeAmount)),
+              divider(),
+              pw.SizedBox(height: 4),
+              pw.Text(
+                thankYouMessage,
+                textAlign: pw.TextAlign.center,
+                style: const pw.TextStyle(fontSize: 8),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+
+    return doc.save();
+  }
+
+  // ---------------------------------------------------------------------------
   // UI
-  // ===========================================================
+  // ---------------------------------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
     final cart = context.watch<CartProvider>();
-
-    context.watch<ProductProvider>();
+    context.watch<ProductProvider>(); // Rebuild saat stok/produk berubah.
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -515,7 +603,7 @@ class _PosScreenState extends State<PosScreen> {
     );
   }
 
-  /// Katalog produk: pencarian, filter kategori, dan grid produk.
+  /// Katalog produk: pencarian, filter kategori, tombol jasa, dan grid produk.
   Widget _buildCatalog() {
     final products = _filteredProducts;
 
@@ -524,67 +612,74 @@ class _PosScreenState extends State<PosScreen> {
         Container(
           padding: const EdgeInsets.all(12),
           color: Colors.white,
-          child: Row(
+          child: Column(
             children: [
-              Expanded(
-                flex: 3,
-                child: TextField(
-                  controller: _searchController,
-                  decoration: InputDecoration(
-                    hintText: 'Cari nama / SKU',
-                    prefixIcon: const Icon(Icons.search),
-                    suffixIcon: _searchQuery.isNotEmpty
-                        ? IconButton(
-                            icon: const Icon(Icons.clear),
-                            onPressed: () {
-                              _searchController.clear();
-
-                              setState(() {
-                                _searchQuery = '';
-                              });
-                            },
-                          )
-                        : null,
-                  ),
-                  onChanged: (value) {
-                    setState(() {
-                      _searchQuery = value;
-                    });
-                  },
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                flex: 2,
-                child: DropdownButtonFormField<int?>(
-                  value: _selectedCategoryId,
-                  isExpanded: true,
-                  decoration: const InputDecoration(
-                    labelText: 'Kategori',
-                  ),
-                  items: [
-                    const DropdownMenuItem<int?>(
-                      value: null,
-                      child: Text(
-                        'Semua',
-                        overflow: TextOverflow.ellipsis,
+              Row(
+                children: [
+                  Expanded(
+                    flex: 3,
+                    child: TextField(
+                      controller: _searchController,
+                      decoration: InputDecoration(
+                        hintText: 'Cari nama / SKU',
+                        prefixIcon: const Icon(Icons.search),
+                        suffixIcon: _searchQuery.isNotEmpty
+                            ? IconButton(
+                                icon: const Icon(Icons.clear),
+                                onPressed: () {
+                                  _searchController.clear();
+                                  setState(() {
+                                    _searchQuery = '';
+                                  });
+                                },
+                              )
+                            : null,
                       ),
+                      onChanged: (value) {
+                        setState(() {
+                          _searchQuery = value;
+                        });
+                      },
                     ),
-                    ..._categories.map((cat) {
-                      return DropdownMenuItem<int?>(
-                        value: cat.id,
-                        child: Text(
-                          cat.name ?? '',
-                          overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    flex: 2,
+                    child: DropdownButtonFormField<int?>(
+                      value: _selectedCategoryId,
+                      isExpanded: true,
+                      decoration: const InputDecoration(labelText: 'Kategori'),
+                      items: [
+                        const DropdownMenuItem<int?>(
+                          value: null,
+                          child: Text('Semua', overflow: TextOverflow.ellipsis),
                         ),
-                      );
-                    }),
-                  ],
-                  onChanged: (value) {
-                    setState(() {
-                      _selectedCategoryId = value;
-                    });
-                  },
+                        ..._categories.map((cat) {
+                          return DropdownMenuItem<int?>(
+                            value: cat.id,
+                            child: Text(
+                              cat.name ?? '',
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          );
+                        }),
+                      ],
+                      onChanged: (value) {
+                        setState(() {
+                          _selectedCategoryId = value;
+                        });
+                      },
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  icon: const Icon(Icons.build),
+                  label: const Text('Tambah Jasa'),
+                  onPressed: _isProcessingPayment ? null : _showAddServiceDialog,
                 ),
               ),
             ],
@@ -598,11 +693,7 @@ class _PosScreenState extends State<PosScreen> {
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Icon(
-                          Icons.search_off,
-                          size: 48,
-                          color: Colors.grey,
-                        ),
+                        Icon(Icons.search_off, size: 48, color: Colors.grey),
                         SizedBox(height: 8),
                         Text(
                           'Produk tidak ditemukan.',
@@ -633,10 +724,7 @@ class _PosScreenState extends State<PosScreen> {
 
   /// Bar ringkas keranjang di bawah layar (khusus HP).
   Widget _buildCartBar(CartProvider cart) {
-    final count = cart.items.fold<int>(
-      0,
-      (sum, item) => sum + item.quantity,
-    );
+    final count = cart.items.fold<int>(0, (sum, item) => sum + item.quantity);
 
     return SafeArea(
       top: false,
@@ -647,10 +735,7 @@ class _PosScreenState extends State<PosScreen> {
           padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
           child: Row(
             children: [
-              const Icon(
-                Icons.shopping_cart,
-                color: Color(0xFF1F4E79),
-              ),
+              const Icon(Icons.shopping_cart, color: Color(0xFF1F4E79)),
               const SizedBox(width: 12),
               Expanded(
                 child: Column(
@@ -659,10 +744,7 @@ class _PosScreenState extends State<PosScreen> {
                   children: [
                     Text(
                       '$count item',
-                      style: const TextStyle(
-                        fontSize: 12,
-                        color: Colors.grey,
-                      ),
+                      style: const TextStyle(fontSize: 12, color: Colors.grey),
                     ),
                     FittedBox(
                       fit: BoxFit.scaleDown,
@@ -681,7 +763,7 @@ class _PosScreenState extends State<PosScreen> {
               ),
               const SizedBox(width: 8),
               ElevatedButton(
-                onPressed: _isProcessingPayment ? null : _showCartSheet,
+                onPressed: _showCartSheet,
                 child: const Text('Lihat Keranjang'),
               ),
             ],
@@ -698,14 +780,11 @@ class _PosScreenState extends State<PosScreen> {
       isScrollControlled: true,
       useSafeArea: true,
       shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(
-          top: Radius.circular(16),
-        ),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
       clipBehavior: Clip.antiAlias,
       builder: (sheetContext) {
         final height = MediaQuery.of(sheetContext).size.height * 0.85;
-
         return Padding(
           padding: EdgeInsets.only(
             bottom: MediaQuery.of(sheetContext).viewInsets.bottom,
@@ -713,12 +792,8 @@ class _PosScreenState extends State<PosScreen> {
           child: SizedBox(
             height: height,
             child: Consumer<CartProvider>(
-              builder: (context, cart, _) {
-                return _buildCartPanel(
-                  cart,
-                  sheetContext: sheetContext,
-                );
-              },
+              builder: (context, cart, _) =>
+                  _buildCartPanel(cart, sheetContext: sheetContext),
             ),
           ),
         );
@@ -726,11 +801,8 @@ class _PosScreenState extends State<PosScreen> {
     );
   }
 
-  /// Panel keranjang untuk layar lebar dan bottom sheet.
-  Widget _buildCartPanel(
-    CartProvider cart, {
-    BuildContext? sheetContext,
-  }) {
+  /// Panel keranjang: dipakai di sisi kanan (layar lebar) dan di bottom sheet.
+  Widget _buildCartPanel(CartProvider cart, {BuildContext? sheetContext}) {
     return Container(
       color: const Color(0xFFF5F7FA),
       child: LayoutBuilder(
@@ -743,10 +815,7 @@ class _PosScreenState extends State<PosScreen> {
                 color: const Color(0xFF1F4E79),
                 child: Row(
                   children: [
-                    const Icon(
-                      Icons.shopping_cart,
-                      color: Colors.white,
-                    ),
+                    const Icon(Icons.shopping_cart, color: Colors.white),
                     const SizedBox(width: 8),
                     const Expanded(
                       child: Text(
@@ -760,13 +829,8 @@ class _PosScreenState extends State<PosScreen> {
                     ),
                     if (sheetContext != null)
                       IconButton(
-                        icon: const Icon(
-                          Icons.close,
-                          color: Colors.white,
-                        ),
-                        onPressed: () {
-                          Navigator.pop(sheetContext);
-                        },
+                        icon: const Icon(Icons.close, color: Colors.white),
+                        onPressed: () => Navigator.pop(sheetContext),
                         tooltip: 'Tutup',
                       ),
                   ],
@@ -778,11 +842,8 @@ class _PosScreenState extends State<PosScreen> {
                         child: Column(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            Icon(
-                              Icons.remove_shopping_cart,
-                              size: 48,
-                              color: Colors.grey,
-                            ),
+                            Icon(Icons.remove_shopping_cart,
+                                size: 48, color: Colors.grey),
                             SizedBox(height: 8),
                             Text(
                               'Keranjang kosong',
@@ -795,17 +856,13 @@ class _PosScreenState extends State<PosScreen> {
                         padding: const EdgeInsets.all(8),
                         itemCount: cart.items.length,
                         itemBuilder: (context, index) {
-                          return _buildCartItem(
-                            cart.items[index],
-                            cart,
-                          );
+                          return _buildCartItem(cart.items[index], cart);
                         },
                       ),
               ),
               ConstrainedBox(
-                constraints: BoxConstraints(
-                  maxHeight: constraints.maxHeight * 0.6,
-                ),
+                constraints:
+                    BoxConstraints(maxHeight: constraints.maxHeight * 0.6),
                 child: Container(
                   color: Colors.white,
                   child: SingleChildScrollView(
@@ -814,21 +871,12 @@ class _PosScreenState extends State<PosScreen> {
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         _buildSummaryRow(
-                          'Subtotal',
-                          formatRupiah(cart.itemSubtotal),
-                          false,
-                        ),
+                            'Subtotal', formatRupiah(cart.itemSubtotal), false),
                         _buildSummaryRow(
-                          'Diskon',
-                          '-${formatRupiah(cart.discount)}',
-                          false,
-                        ),
+                            'Diskon', '-${formatRupiah(cart.discount)}', false),
                         const Divider(),
                         _buildSummaryRow(
-                          'Total',
-                          formatRupiah(cart.total),
-                          true,
-                        ),
+                            'Total', formatRupiah(cart.total), true),
                         const SizedBox(height: 12),
                         TextField(
                           decoration: const InputDecoration(
@@ -840,7 +888,6 @@ class _PosScreenState extends State<PosScreen> {
                             final parsed = int.tryParse(
                               value.replaceAll('.', ''),
                             );
-
                             if (parsed != null) {
                               cart.setCashReceived(parsed);
                             }
@@ -867,7 +914,6 @@ class _PosScreenState extends State<PosScreen> {
                                     if (sheetContext != null) {
                                       Navigator.pop(sheetContext);
                                     }
-
                                     _openCheckout();
                                   },
                             child: const Text('Bayar'),
@@ -887,7 +933,6 @@ class _PosScreenState extends State<PosScreen> {
 
   Widget _buildProductCard(Product product) {
     final isLowStock = product.isLowStock;
-
     return Card(
       clipBehavior: Clip.antiAlias,
       child: Column(
@@ -901,14 +946,10 @@ class _PosScreenState extends State<PosScreen> {
                   ? Image.file(
                       File(product.photoPath!),
                       fit: BoxFit.cover,
-                      errorBuilder: (_, __, ___) {
-                        return const Icon(Icons.broken_image);
-                      },
+                      errorBuilder: (_, __, ___) =>
+                          const Icon(Icons.broken_image),
                     )
-                  : const Icon(
-                      Icons.image_not_supported,
-                      size: 40,
-                    ),
+                  : const Icon(Icons.image_not_supported, size: 40),
             ),
           ),
           Padding(
@@ -990,22 +1031,17 @@ class _PosScreenState extends State<PosScreen> {
                   width: 44,
                   height: 44,
                   color: Colors.grey[200],
-                  child: item.product.photoPath != null &&
-                          item.product.photoPath!.isNotEmpty
-                      ? Image.file(
-                          File(item.product.photoPath!),
-                          fit: BoxFit.cover,
-                          errorBuilder: (_, __, ___) {
-                            return const Icon(
-                              Icons.image,
-                              size: 20,
-                            );
-                          },
-                        )
-                      : const Icon(
-                          Icons.image,
-                          size: 20,
-                        ),
+                  child: item.product.isService
+                      ? const Icon(Icons.build, size: 20)
+                      : (item.product.photoPath != null &&
+                              item.product.photoPath!.isNotEmpty
+                          ? Image.file(
+                              File(item.product.photoPath!),
+                              fit: BoxFit.cover,
+                              errorBuilder: (_, __, ___) =>
+                                  const Icon(Icons.image, size: 20),
+                            )
+                          : const Icon(Icons.image, size: 20)),
                 ),
                 const SizedBox(width: 8),
                 Expanded(
@@ -1016,32 +1052,23 @@ class _PosScreenState extends State<PosScreen> {
                         item.product.name,
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontWeight: FontWeight.w600,
-                        ),
+                        style: const TextStyle(fontWeight: FontWeight.w600),
                       ),
                       Text(
                         '${formatRupiah(item.product.sellingPrice)} x ${item.quantity}',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 12,
-                          color: Colors.grey,
-                        ),
+                        style:
+                            const TextStyle(fontSize: 12, color: Colors.grey),
                       ),
                     ],
                   ),
                 ),
                 IconButton(
-                  icon: const Icon(
-                    Icons.delete_outline,
-                    color: Colors.red,
-                  ),
+                  icon: const Icon(Icons.delete_outline, color: Colors.red),
                   padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(
-                    minWidth: 36,
-                    minHeight: 36,
-                  ),
+                  constraints:
+                      const BoxConstraints(minWidth: 36, minHeight: 36),
                   onPressed: () => cart.removeItem(index),
                 ),
               ],
@@ -1050,41 +1077,25 @@ class _PosScreenState extends State<PosScreen> {
             Row(
               children: [
                 IconButton(
-                  icon: const Icon(
-                    Icons.remove_circle_outline,
-                    size: 22,
-                  ),
+                  icon: const Icon(Icons.remove_circle_outline, size: 22),
                   padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(
-                    minWidth: 36,
-                    minHeight: 36,
-                  ),
-                  onPressed: () {
-                    cart.setQuantity(index, item.quantity - 1);
-                  },
+                  constraints:
+                      const BoxConstraints(minWidth: 36, minHeight: 36),
+                  onPressed: () => cart.setQuantity(index, item.quantity - 1),
                 ),
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 6),
                   child: Text(
                     item.quantity.toString(),
-                    style: const TextStyle(
-                      fontWeight: FontWeight.bold,
-                    ),
+                    style: const TextStyle(fontWeight: FontWeight.bold),
                   ),
                 ),
                 IconButton(
-                  icon: const Icon(
-                    Icons.add_circle_outline,
-                    size: 22,
-                  ),
+                  icon: const Icon(Icons.add_circle_outline, size: 22),
                   padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(
-                    minWidth: 36,
-                    minHeight: 36,
-                  ),
-                  onPressed: () {
-                    cart.setQuantity(index, item.quantity + 1);
-                  },
+                  constraints:
+                      const BoxConstraints(minWidth: 36, minHeight: 36),
+                  onPressed: () => cart.setQuantity(index, item.quantity + 1),
                 ),
                 Expanded(
                   child: Align(
@@ -1093,9 +1104,7 @@ class _PosScreenState extends State<PosScreen> {
                       fit: BoxFit.scaleDown,
                       child: Text(
                         formatRupiah(item.subtotal),
-                        style: const TextStyle(
-                          fontWeight: FontWeight.bold,
-                        ),
+                        style: const TextStyle(fontWeight: FontWeight.bold),
                       ),
                     ),
                   ),
@@ -1108,11 +1117,7 @@ class _PosScreenState extends State<PosScreen> {
     );
   }
 
-  Widget _buildSummaryRow(
-    String label,
-    String value,
-    bool isTotal,
-  ) {
+  Widget _buildSummaryRow(String label, String value, bool isTotal) {
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
@@ -1133,6 +1138,93 @@ class _PosScreenState extends State<PosScreen> {
               color: isTotal ? const Color(0xFF1F4E79) : Colors.black,
             ),
           ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Dialog input jasa manual: nama jasa dan harga.
+class _ServiceDialog extends StatefulWidget {
+  const _ServiceDialog();
+
+  @override
+  State<_ServiceDialog> createState() => _ServiceDialogState();
+}
+
+class _ServiceDialogState extends State<_ServiceDialog> {
+  final _formKey = GlobalKey<FormState>();
+  final _nameController = TextEditingController();
+  final _priceController = TextEditingController();
+
+  @override
+  void dispose() {
+    _nameController.dispose();
+    _priceController.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    if (!_formKey.currentState!.validate()) return;
+    final price =
+        int.parse(_priceController.text.replaceAll('.', '').trim());
+    Navigator.pop(context, {
+      'name': _nameController.text.trim(),
+      'price': price,
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Tambah Jasa'),
+      content: SingleChildScrollView(
+        child: Form(
+          key: _formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextFormField(
+                controller: _nameController,
+                autofocus: true,
+                textCapitalization: TextCapitalization.sentences,
+                decoration: const InputDecoration(
+                  labelText: 'Nama Jasa Perbaikan *',
+                ),
+                validator: (v) => v == null || v.trim().isEmpty
+                    ? 'Nama jasa harus diisi'
+                    : null,
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _priceController,
+                decoration: const InputDecoration(
+                  labelText: 'Harga (Rp) *',
+                  prefixText: 'Rp ',
+                ),
+                keyboardType: TextInputType.number,
+                onFieldSubmitted: (_) => _submit(),
+                validator: (v) {
+                  final val =
+                      int.tryParse((v ?? '').replaceAll('.', '').trim());
+                  if (val == null || val <= 0) {
+                    return 'Harga tidak valid';
+                  }
+                  return null;
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Batal'),
+        ),
+        ElevatedButton(
+          onPressed: _submit,
+          child: const Text('Tambah'),
         ),
       ],
     );

@@ -93,7 +93,7 @@ class Sidebar extends StatelessWidget {
                   ),
                   _buildMenuItem(
                     icon: Icons.inventory,
-                    title: 'Produk & Jasa',
+                    title: 'Produk',
                     route: AppRoute.productList,
                   ),
                   _buildMenuItem(

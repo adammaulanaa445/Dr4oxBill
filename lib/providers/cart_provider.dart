@@ -83,8 +83,9 @@ class CartProvider extends ChangeNotifier {
 
   /// Tambah produk ke keranjang atau tambah kuantitas jika sudah ada.
   void addProduct(Product product, {int quantity = 1}) {
-    final existingIndex =
-        _items.indexWhere((item) => item.product.id == product.id);
+    final existingIndex = product.id == null
+        ? -1
+        : _items.indexWhere((item) => item.product.id == product.id);
     if (existingIndex >= 0) {
       _items[existingIndex] = _items[existingIndex].copyWith(
         quantity: _items[existingIndex].quantity + quantity,
@@ -92,6 +93,23 @@ class CartProvider extends ChangeNotifier {
     } else {
       _items.add(CartItem(product: product, quantity: quantity));
     }
+    notifyListeners();
+  }
+
+  /// Tambah jasa manual (tidak terdaftar sebagai produk di database).
+  /// Selalu menjadi baris baru, tidak digabung dengan item lain.
+  void addManualService({required String name, required int price}) {
+    final now = DateTime.now();
+    final service = Product(
+      id: null,
+      name: name,
+      sku: 'JASA-MANUAL',
+      itemType: 'service',
+      sellingPrice: price,
+      createdAt: now,
+      updatedAt: now,
+    );
+    _items.add(CartItem(product: service, quantity: 1));
     notifyListeners();
   }
 
@@ -111,9 +129,10 @@ class CartProvider extends ChangeNotifier {
     } else {
       final item = _items[index];
       // Batasi ke stok tersedia untuk barang fisik.
-      final maxQty =
-          item.product.isGoods ? item.product.stock : quantity;
-      _items[index] = item.copyWith(quantity: quantity.clamp(1, maxQty > 0 ? maxQty : 1));
+      final maxQty = item.product.isGoods ? item.product.stock : quantity;
+      _items[index] = item.copyWith(
+        quantity: quantity.clamp(1, maxQty > 0 ? maxQty : 1),
+      );
     }
     notifyListeners();
   }
@@ -155,6 +174,7 @@ class CartProvider extends ChangeNotifier {
   }
 
   /// Konversi keranjang ke daftar data item transaksi untuk disimpan.
+  /// Jasa manual disimpan dengan product_id null.
   List<Map<String, dynamic>> toTransactionItems() {
     return _items.map((item) {
       return {
@@ -171,6 +191,7 @@ class CartProvider extends ChangeNotifier {
   }
 
   /// Konversi keranjang ke daftar pembaruan stok untuk transaksi.
+  /// Hanya barang fisik; jasa tidak mengubah stok.
   List<Map<String, dynamic>> toStockUpdates() {
     return _items.where((item) => item.product.isGoods).map((item) {
       return {
